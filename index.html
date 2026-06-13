@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>실시간 얼굴 → 아바타 애니메이션 (MediaPipe + aniface)</title>
+
+<!-- CDN 모듈 매핑: 단 하나의 three 인스턴스를 모두가 공유하도록 importmap으로 고정 -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three/build/three.module.js",
+    "three/": "./vendor/three/",
+    "@mediapipe/tasks-vision": "./vendor/mediapipe/vision_bundle.mjs",
+    "aniface": "./vendor/aniface/index.js"
+  }
+}
+</script>
+
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --panel2: #1c2330; --line: #2b3340;
+    --text: #e6edf3; --muted: #8b97a7; --accent: #4f8cff; --accent2: #2dd4bf;
+    --danger: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Pretendard, "Apple SD Gothic Neo", sans-serif; }
+  #app { display: flex; flex-direction: column; height: 100vh; }
+  header { padding: 10px 16px; border-bottom: 1px solid var(--line); display: flex;
+    align-items: center; gap: 12px; flex: 0 0 auto; }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0; }
+  header .tag { font-size: 11px; color: var(--muted); border: 1px solid var(--line);
+    padding: 2px 8px; border-radius: 999px; }
+  main { flex: 1 1 auto; display: flex; min-height: 0; }
+  #stage { flex: 1 1 auto; position: relative; min-width: 0; background:
+    radial-gradient(120% 120% at 50% 30%, #1a2230 0%, #0e1116 70%); }
+  #avatarCanvas { display: block; width: 100%; height: 100%; }
+
+  /* 웹캠 미리보기 */
+  #camBox { position: absolute; left: 14px; bottom: 14px; width: 180px;
+    border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+    background: #000; box-shadow: 0 6px 24px rgba(0,0,0,.4); }
+  #camBox video { display: block; width: 100%; height: auto; }
+  #camBox.mirror video { transform: scaleX(-1); }
+  #camBox .lbl { position: absolute; top: 6px; left: 8px; font-size: 10px;
+    color: #cfe; text-shadow: 0 1px 2px #000; }
+  #faceDot { position: absolute; top: 6px; right: 8px; width: 9px; height: 9px;
+    border-radius: 50%; background: #555; box-shadow: 0 0 0 2px rgba(0,0,0,.4); }
+  #faceDot.on { background: var(--accent2); }
+
+  /* 컨트롤 패널 */
+  aside { flex: 0 0 300px; background: var(--panel); border-left: 1px solid var(--line);
+    overflow-y: auto; padding: 14px 14px 28px; }
+  aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em;
+    color: var(--muted); margin: 18px 0 8px; }
+  aside h2:first-child { margin-top: 4px; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
+  .btn { appearance: none; border: 1px solid var(--line); background: var(--panel2);
+    color: var(--text); padding: 10px 14px; border-radius: 9px; font-size: 13px;
+    cursor: pointer; width: 100%; transition: .15s; }
+  .btn:hover { border-color: var(--accent); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .btn.primary.stop { background: var(--danger); border-color: var(--danger); }
+  select, input[type=range] { width: 100%; }
+  select { background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px; font-size: 13px; }
+  .slider { margin: 10px 0; }
+  .slider label { display: flex; justify-content: space-between; font-size: 12px;
+    color: var(--muted); margin-bottom: 4px; }
+  .slider label b { color: var(--text); font-weight: 600; }
+  .toggle { display: flex; align-items: center; justify-content: space-between;
+    font-size: 13px; padding: 8px 0; }
+  .switch { position: relative; width: 40px; height: 22px; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .track { position: absolute; inset: 0; background: var(--line); border-radius: 999px;
+    transition: .2s; cursor: pointer; }
+  .track::before { content: ""; position: absolute; width: 16px; height: 16px; left: 3px;
+    top: 3px; background: #fff; border-radius: 50%; transition: .2s; }
+  .switch input:checked + .track { background: var(--accent); }
+  .switch input:checked + .track::before { transform: translateX(18px); }
+  .status { font-size: 12px; color: var(--muted); line-height: 1.7; margin-top: 6px;
+    border-top: 1px solid var(--line); padding-top: 10px; }
+  .status b { color: var(--text); }
+  .hint { font-size: 11px; color: var(--muted); line-height: 1.5; margin-top: 4px; }
+
+  /* 오버레이 */
+  .overlay { position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px; text-align: center;
+    padding: 24px; background: rgba(14,17,22,.82); backdrop-filter: blur(3px); z-index: 5; }
+  .overlay.hidden { display: none; }
+  .overlay h3 { margin: 0; font-size: 18px; }
+  .overlay p { margin: 0; color: var(--muted); max-width: 420px; font-size: 13px; line-height: 1.6; }
+  .spinner { width: 30px; height: 30px; border: 3px solid var(--line);
+    border-top-color: var(--accent); border-radius: 50%; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #errOverlay { color: var(--danger); }
+  #errOverlay p { color: #ffd0d0; white-space: pre-wrap; word-break: break-word; }
+  .bigStart { padding: 14px 28px; font-size: 16px; }
+
+  @media (max-width: 760px) {
+    main { flex-direction: column; }
+    aside { flex: 0 0 auto; border-left: none; border-top: 1px solid var(--line); }
+    #stage { min-height: 50vh; }
+    #camBox { width: 120px; }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>🎭 실시간 얼굴 → 아바타</h1>
+    <span class="tag">MediaPipe Face Landmarker · aniface · Three.js</span>
+  </header>
+
+  <main>
+    <div id="stage">
+      <canvas id="avatarCanvas"></canvas>
+
+      <div id="camBox" class="mirror">
+        <span class="lbl">내 웹캠</span>
+        <span id="faceDot"></span>
+        <video id="webcam" autoplay muted playsinline></video>
+      </div>
+
+      <!-- 시작 게이트 -->
+      <div id="gate" class="overlay">
+        <h3>웹캠으로 아바타를 움직여 보세요</h3>
+        <p>아래 버튼을 누르면 카메라 권한을 요청합니다. 얼굴 표정·고개 움직임이 3D 아바타에 실시간으로 반영됩니다. (카메라 영상은 브라우저 안에서만 처리되며 외부로 전송되지 않습니다.)</p>
+        <button id="startBtn" class="btn primary bigStart">▶ 시작하기</button>
+      </div>
+
+      <!-- 로딩 -->
+      <div id="loading" class="overlay hidden">
+        <div class="spinner"></div>
+        <p id="loadingMsg">초기화 중…</p>
+      </div>
+
+      <!-- 오류 -->
+      <div id="errOverlay" class="overlay hidden">
+        <h3>⚠️ 오류</h3>
+        <p id="errMsg"></p>
+        <button id="errClose" class="btn">닫기</button>
+      </div>
+    </div>
+
+    <aside>
+      <h2>제어</h2>
+      <button id="toggleBtn" class="btn primary stop" disabled>■ 정지</button>
+
+      <h2>아바타</h2>
+      <select id="avatarSel">
+        <option value="./models/avatar-xaJd1is2QdMaYBnw2FzE.glb">아바타 1</option>
+        <option value="./models/avatar-EnCDAMIOohA8cqtbw1Hg.glb">아바타 2</option>
+      </select>
+      <div class="hint">‘구도 고정’을 끄면 드래그로 회전, 스크롤로 확대할 수 있어요.</div>
+
+      <h2>구도 (화면)</h2>
+      <div class="slider">
+        <label>확대 <b id="vZoom">1.25×</b></label>
+        <input type="range" id="sZoom" min="0.6" max="2.4" step="0.05" value="1.25" />
+      </div>
+      <div class="slider">
+        <label>상하 위치 <b id="vVy">+0.06</b></label>
+        <input type="range" id="sVy" min="-0.15" max="0.30" step="0.01" value="0.06" />
+      </div>
+      <div class="toggle">
+        <span>구도 고정 (드래그·줌 잠금)</span>
+        <label class="switch"><input type="checkbox" id="lockChk" checked /><span class="track"></span></label>
+      </div>
+
+      <h2>표정 강도</h2>
+      <div class="slider">
+        <label>전체 강도 <b id="vMaster">1.0×</b></label>
+        <input type="range" id="sMaster" min="0" max="2" step="0.05" value="1" />
+      </div>
+      <div class="slider">
+        <label>입 벌림 (jawOpen) <b id="vJaw">1.0×</b></label>
+        <input type="range" id="sJaw" min="0" max="2" step="0.05" value="1" />
+      </div>
+      <div class="slider">
+        <label>미소 (mouthSmile) <b id="vSmile">1.0×</b></label>
+        <input type="range" id="sSmile" min="0" max="2" step="0.05" value="1" />
+      </div>
+      <div class="slider">
+        <label>눈 깜빡임 (eyeBlink) <b id="vBlink">1.2×</b></label>
+        <input type="range" id="sBlink" min="0" max="2" step="0.05" value="1.2" />
+      </div>
+      <div class="slider">
+        <label>눈썹 (brow) <b id="vBrow">1.2×</b></label>
+        <input type="range" id="sBrow" min="0" max="2" step="0.05" value="1.2" />
+      </div>
+      <div class="slider">
+        <label>눈 크게 (eyeWide) <b id="vWide">1.1×</b></label>
+        <input type="range" id="sWide" min="0" max="2" step="0.05" value="1.1" />
+      </div>
+
+      <h2>움직임</h2>
+      <div class="slider">
+        <label>부드러움 (스무딩) <b id="vSmooth">0.50</b></label>
+        <input type="range" id="sSmooth" min="0" max="0.9" step="0.05" value="0.5" />
+      </div>
+      <div class="hint">값이 높을수록 떨림이 줄지만 반응이 느려집니다.</div>
+
+      <div class="toggle">
+        <span>웹캠 미리보기 좌우반전</span>
+        <label class="switch"><input type="checkbox" id="mirrorChk" checked /><span class="track"></span></label>
+      </div>
+
+      <div class="status" id="status">
+        상태: <b id="stState">대기</b><br />
+        얼굴 인식: <b id="stFace">—</b><br />
+        추적 속도: <b id="stFps">— FPS</b>
+      </div>
+    </aside>
+  </main>
+</div>
+
+<script type="module">
+  // ── 외부 라이브러리 로드 (CDN 실패 시 친절한 오류) ──────────────────
+  let Aniface, MEDIAPIPE_BLENDSHAPE_NAMES, FaceLandmarker, FilesetResolver, THREE;
+  try {
+    const [aniface, mp, three] = await Promise.all([
+      import('aniface'),
+      import('@mediapipe/tasks-vision'),
+      import('three'),
+    ]);
+    Aniface = aniface.Aniface;
+    MEDIAPIPE_BLENDSHAPE_NAMES = aniface.MEDIAPIPE_BLENDSHAPE_NAMES;
+    FaceLandmarker = mp.FaceLandmarker;
+    FilesetResolver = mp.FilesetResolver;
+    THREE = three;
+  } catch (e) {
+    showError('라이브러리(CDN) 로드 실패: ' + (e?.message || e) +
+      '\n\n인터넷 연결을 확인하거나, 파일을 file:// 로 직접 열지 말고 로컬 서버로 실행했는지 확인하세요.');
+    throw e;
+  }
+
+  // ── 상수 ─────────────────────────────────────────────────────────────
+  // 모든 의존성을 ./vendor/ 로컬에서 로드 → 외부 인터넷 불필요 (폐쇄망 OK)
+  const WASM_PATH  = './vendor/mediapipe/wasm';
+  const MODEL_PATH = './vendor/mediapipe/face_landmarker.task';
+  const DETECT_FPS = 30;
+
+  // 표정 강도: aniface가 매 프레임 참조하는 "하나의" 객체. 값만 바꾸면 실시간 반영됨.
+  const multipliers = {};
+  const GROUPS = {
+    jawOpen:   ['jawOpen'],
+    mouthSmile:['mouthSmileLeft', 'mouthSmileRight'],
+    eyeBlink:  ['eyeBlinkLeft', 'eyeBlinkRight'],
+    brow:      ['browInnerUp', 'browOuterUpLeft', 'browOuterUpRight'],
+    eyeWide:   ['eyeWideLeft', 'eyeWideRight'],
+  };
+  let master = 1;
+  const gain = { jawOpen: 1, mouthSmile: 1, eyeBlink: 1.2, brow: 1.2, eyeWide: 1.1 };
+  function recompute() {
+    for (const n of MEDIAPIPE_BLENDSHAPE_NAMES) multipliers[n] = master;
+    for (const [g, names] of Object.entries(GROUPS))
+      for (const n of names) multipliers[n] = master * gain[g];
+  }
+  recompute();
+
+  // ── DOM ──────────────────────────────────────────────────────────────
+  const $ = (id) => document.getElementById(id);
+  const stage = $('stage'), canvas = $('avatarCanvas'), video = $('webcam');
+  const gate = $('gate'), loading = $('loading'), loadingMsg = $('loadingMsg');
+  const errOverlay = $('errOverlay'), errMsg = $('errMsg');
+  const toggleBtn = $('toggleBtn'), avatarSel = $('avatarSel');
+
+  // ── 상태 ─────────────────────────────────────────────────────────────
+  let avatar = null, faceLandmarker = null, stream = null;
+  let running = false, switching = false, rafId = null;
+  let smoothing = 0.5, lastDetect = 0;
+  let prevScores = new Map(), prevMat = null;
+  let fpsCount = 0, fpsT = performance.now();
+
+  // ── 오버레이 / 오류 ───────────────────────────────────────────────────
+  function showError(msg) {
+    if (!errMsg) { alert(msg); return; }
+    errMsg.textContent = msg;
+    errOverlay.classList.remove('hidden');
+    loading.classList.add('hidden');
+  }
+  $('errClose')?.addEventListener('click', () => errOverlay.classList.add('hidden'));
+  function setLoading(on, msg) { loading.classList.toggle('hidden', !on); if (msg) loadingMsg.textContent = msg; }
+
+  // ── 캔버스 크기 ───────────────────────────────────────────────────────
+  function fit() {
+    const w = stage.clientWidth, h = stage.clientHeight;
+    canvas.width = w; canvas.height = h;
+    if (avatar?.updateSize) avatar.updateSize(w, h);
+  }
+  window.addEventListener('resize', fit);
+
+  // ── 웹캠 ─────────────────────────────────────────────────────────────
+  async function startCamera() {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+      audio: false,
+    });
+    video.srcObject = stream;
+    await video.play();
+    // 첫 프레임이 들어올 때까지 대기
+    if (video.readyState < 2) await new Promise((r) => video.addEventListener('loadeddata', r, { once: true }));
+  }
+  function stopCamera() {
+    stream?.getTracks().forEach((t) => t.stop());
+    stream = null; video.srcObject = null;
+  }
+
+  // ── MediaPipe Face Landmarker ────────────────────────────────────────
+  async function initMediaPipe() {
+    let vision;
+    try { vision = await FilesetResolver.forVisionTasks(WASM_PATH); }
+    catch (e) { throw new Error('MediaPipe WASM 로드 실패 (' + WASM_PATH + '). vendor/mediapipe/wasm 파일을 확인하세요.\n원본: ' + (e?.message || e)); }
+    const opts = (delegate) => ({
+      baseOptions: { modelAssetPath: MODEL_PATH, delegate },
+      outputFaceBlendshapes: true,
+      outputFacialTransformationMatrixes: true,
+      runningMode: 'VIDEO',
+      numFaces: 1,
+    });
+    try {
+      return await FaceLandmarker.createFromOptions(vision, opts('GPU'));
+    } catch (eGpu) {
+      console.warn('GPU 델리게이트 실패 → CPU로 재시도', eGpu);
+      try {
+        return await FaceLandmarker.createFromOptions(vision, opts('CPU'));
+      } catch (eCpu) {
+        throw new Error('얼굴 인식 모델 로드 실패. ' + MODEL_PATH + ' 파일이 있는지 확인하세요.\n→ setup-model.sh 실행(또는 수동 다운로드)으로 모델을 받아 vendor/mediapipe/ 에 두세요.\n원본: ' + (eCpu?.message || eCpu));
+      }
+    }
+  }
+
+  // ── 아바타 생성 / 교체 (manual 모드: 렌더러만, MediaPipe는 따로 유지) ──
+  async function buildAvatar(modelPath) {
+    if (avatar) { avatar.destroy(); avatar = null; }
+    fit(); // new Aniface 이전에 캔버스 크기 확정 → 올바른 종횡비
+    const a = new Aniface({
+      canvasElement: canvas,      // videoElement 없음 = manual 입력 모드
+      modelPath,
+      blendshapeMultipliers: multipliers,   // 공유 참조 (슬라이더가 실시간으로 mutate)
+      modelOptions: {
+        scale: 1.0, center: true, autoRotate: true, rotation: 0,   // 이 아바타는 네이티브로 정면을 봄(PI면 뒤통수)
+        fullBodyAvatar: true, axisMapping: 'standard',
+      },
+      cameraConfig: { fov: 45, enableControls: true, enableZoom: true, position: [0, 0, 1.2], target: [0, 0, 0] },
+      lightingConfig: { ambientIntensity: 1.1, directionalIntensity: 1.4, directionalPosition: [2, 3, 3] },
+      onError: (err) => showError('아바타 처리 오류: ' + (err?.message || err)),
+    });
+    await a.initialize();
+    avatar = a;
+    frameHead(avatar);   // 전신 모델 → 얼굴이 화면에 오도록 카메라 재배치
+    fit();
+  }
+
+  // 머리 위치/크기를 찾아 저장한 뒤 구도 파라미터로 카메라를 배치
+  let frameCache = null;                         // { baseTarget, size }
+  const framing = { zoom: 1.25, vy: 0.06, lock: true };
+  function frameHead(av) {
+    const r = av.getRenderer?.(); if (!r) return;
+    const scene = r.getScene?.(), cam = r.getCamera?.(); if (!scene || !cam) return;
+    scene.updateMatrixWorld(true);
+    let head = null;
+    scene.traverse((o) => { if (!head && o.isBone && o.name && o.name.toLowerCase() === 'head') head = o; });
+    const box = new THREE.Box3().setFromObject(scene);
+    const size = new THREE.Vector3(); box.getSize(size);
+    const baseTarget = new THREE.Vector3();
+    if (head) head.getWorldPosition(baseTarget);
+    else { box.getCenter(baseTarget); baseTarget.y = box.max.y - size.y * 0.12; }
+    frameCache = { baseTarget, size };
+    applyFraming(av);
+  }
+  // 확대/상하/고정 값을 카메라에 반영 (슬라이더가 실시간 호출)
+  function applyFraming(av) {
+    if (!frameCache) return;
+    const r = av?.getRenderer?.(); const cam = r?.getCamera?.(); if (!cam) return;
+    const { baseTarget, size } = frameCache;
+    const target = baseTarget.clone(); target.y += size.y * framing.vy;
+    const dist = Math.max(size.y * 0.55 / framing.zoom, 0.2);
+    cam.position.set(target.x, target.y, target.z + dist);
+    cam.near = Math.max(dist / 100, 0.01); cam.far = dist * 100; cam.updateProjectionMatrix();
+    const controls = r.controls;
+    if (controls) {
+      controls.target.copy(target);
+      controls.minDistance = dist * 0.25; controls.maxDistance = dist * 5;
+      controls.enabled = !framing.lock;          // 고정 시 드래그·줌 잠금
+      controls.update();
+    } else { cam.lookAt(target); }
+  }
+
+  // ── 시간축 스무딩 (EMA) — 라이브러리에는 없으므로 직접 보강 ───────────
+  function smooth(results) {
+    const f = smoothing;
+    if (f <= 0) return results;
+    const out = { faceLandmarks: results.faceLandmarks };
+
+    const cats = results.faceBlendshapes?.[0]?.categories;
+    if (cats) {
+      const sm = new Array(cats.length);
+      for (let i = 0; i < cats.length; i++) {
+        const c = cats[i];
+        const p = prevScores.get(c.categoryName) ?? c.score;
+        const v = p * f + c.score * (1 - f);
+        prevScores.set(c.categoryName, v);
+        sm[i] = { categoryName: c.categoryName, score: v };
+      }
+      out.faceBlendshapes = [{ categories: sm }];
+    }
+
+    const m = results.facialTransformationMatrixes?.[0]?.data;
+    if (m) {
+      if (!prevMat || prevMat.length !== m.length) prevMat = Array.from(m);
+      const sm = new Array(m.length);
+      for (let i = 0; i < m.length; i++) sm[i] = prevMat[i] * f + m[i] * (1 - f);
+      prevMat = sm;
+      out.facialTransformationMatrixes = [{ data: sm }];
+    }
+    return out;
+  }
+  function resetSmooth() { prevScores.clear(); prevMat = null; }
+
+  // ── 메인 루프 ────────────────────────────────────────────────────────
+  function loop() {
+    rafId = requestAnimationFrame(loop);
+    if (!running) return;
+    const now = performance.now();
+
+    if (avatar?.ready && !switching && faceLandmarker && video.readyState >= 2 &&
+        now - lastDetect >= 1000 / DETECT_FPS) {
+      lastDetect = now;
+      let results = null;
+      try { results = faceLandmarker.detectForVideo(video, now); } catch (e) { /* 일시적 오류 무시 */ }
+      if (results) {
+        const has = (results.faceLandmarks?.length || 0) > 0;
+        setFace(has);
+        try { avatar.processLandmarkData(has ? smooth(results) : results); } catch (e) { /* skip */ }
+      }
+      // FPS
+      fpsCount++;
+      if (now - fpsT >= 1000) { $('stFps').textContent = fpsCount + ' FPS'; fpsCount = 0; fpsT = now; }
+    }
+    // OrbitControls 댐핑이 매끄럽도록 매 프레임 렌더
+    avatar?.getRenderer?.()?.render?.();
+  }
+
+  function setFace(on) {
+    $('faceDot').classList.toggle('on', on);
+    $('stFace').textContent = on ? '✓ 인식됨' : '얼굴 없음';
+  }
+  function setState(s) { $('stState').textContent = s; }
+
+  // ── 시작 / 정지 ──────────────────────────────────────────────────────
+  async function start() {
+    // file:// 로 열면 웹캠은 되지만 모델 fetch가 차단됨 → 명확히 안내
+    if (location.protocol === 'file:') {
+      showError('이 페이지가 file:// 로 열렸습니다.\n브라우저 정책상 모델 파일(.glb) 로드가 차단됩니다(웹캠은 동작해도 모델은 실패).\n\n이 폴더에서 로컬 서버를 실행한 뒤 http://localhost:8000 로 접속하세요:\n\npython3 -m http.server 8000');
+      return;
+    }
+    gate.classList.add('hidden');
+    setLoading(true, '카메라 권한 요청 중…');
+    try {
+      await startCamera();
+      if (!faceLandmarker) { setLoading(true, '얼굴 인식 모델 로딩 중…'); faceLandmarker = await initMediaPipe(); }
+      setLoading(true, '아바타 모델 로딩 중…');
+      await buildAvatar(avatarSel.value);
+      resetSmooth();
+      running = true; setState('실행 중'); setLoading(false);
+      toggleBtn.disabled = false; toggleBtn.textContent = '■ 정지'; toggleBtn.classList.add('stop');
+      if (!rafId) loop();
+    } catch (e) {
+      setLoading(false);
+      let m = (e?.name === 'NotAllowedError')
+        ? '카메라 접근이 거부되었습니다. 브라우저 주소창의 권한을 허용으로 바꾼 뒤 다시 시도하세요.'
+        : (e?.message || String(e));
+      if (/fetch|load avatar/i.test(m)) {
+        m += '\n\n모델 파일을 불러오지 못했습니다. 확인하세요:\n• 로컬 서버로 열었는지 (file:// 아님)\n• 서버를 index.html 이 있는 폴더에서 실행했는지\n• models/ 폴더에 .glb 파일이 있는지\n• 콘솔(F12)에서 실패한 URL/상태 코드';
+      }
+      showError(m); gate.classList.remove('hidden');
+    }
+  }
+  function stop() {
+    running = false; stopCamera(); setState('정지'); setFace(false);
+    toggleBtn.textContent = '▶ 시작'; toggleBtn.classList.remove('stop');
+    gate.classList.remove('hidden');
+  }
+  $('startBtn').addEventListener('click', start);
+  toggleBtn.addEventListener('click', () => { running ? stop() : start(); });
+
+  // ── 아바타 전환 ──────────────────────────────────────────────────────
+  avatarSel.addEventListener('change', async () => {
+    if (!avatar) return;            // 시작 전이면 다음 start에서 반영
+    switching = true; setLoading(true, '아바타 교체 중…');
+    try { await buildAvatar(avatarSel.value); resetSmooth(); }
+    catch (e) { showError('아바타 로드 실패: ' + (e?.message || e)); }
+    finally { switching = false; setLoading(false); }
+  });
+
+  // ── 슬라이더 / 토글 ──────────────────────────────────────────────────
+  const fmt = (v) => (+v).toFixed(2) + '×';
+  function bindGain(sliderId, group, labelId) {
+    $(sliderId).addEventListener('input', (e) => {
+      gain[group] = +e.target.value; $(labelId).textContent = fmt(e.target.value); recompute();
+    });
+  }
+  $('sMaster').addEventListener('input', (e) => { master = +e.target.value; $('vMaster').textContent = fmt(e.target.value); recompute(); });
+  bindGain('sJaw',  'jawOpen',   'vJaw');
+  bindGain('sSmile','mouthSmile','vSmile');
+  bindGain('sBlink','eyeBlink',  'vBlink');
+  bindGain('sBrow', 'brow',      'vBrow');
+  bindGain('sWide', 'eyeWide',   'vWide');
+  $('sSmooth').addEventListener('input', (e) => { smoothing = +e.target.value; $('vSmooth').textContent = (+e.target.value).toFixed(2); });
+  $('mirrorChk').addEventListener('change', (e) => $('camBox').classList.toggle('mirror', e.target.checked));
+
+  // 구도 (확대 / 상하 / 고정)
+  $('sZoom').addEventListener('input', (e) => { framing.zoom = +e.target.value; $('vZoom').textContent = (+e.target.value).toFixed(2) + '×'; if (avatar) applyFraming(avatar); });
+  $('sVy').addEventListener('input', (e) => { framing.vy = +e.target.value; $('vVy').textContent = (e.target.value >= 0 ? '+' : '') + (+e.target.value).toFixed(2); if (avatar) applyFraming(avatar); });
+  $('lockChk').addEventListener('change', (e) => { framing.lock = e.target.checked; if (avatar) applyFraming(avatar); });
+</script>
+</body>
+</html>

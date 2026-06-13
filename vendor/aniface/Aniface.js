@@ -1,0 +1,327 @@
+/**
+ * Main Aniface class - Entry point for the library
+ */
+import { FacialLandmarkManager } from './core/FacialLandmarkManager.js';
+import { AvatarRenderer } from './core/AvatarRenderer.js';
+/**
+ * Aniface - Animate 3D avatars with real-time facial tracking
+ *
+ * This is the main class that brings together facial landmark detection,
+ * 3D rendering, and blendshape animation into a simple, unified API.
+ *
+ * Supports two input modes:
+ * 1. Built-in MediaPipe detection (provide videoElement, call start())
+ * 2. Manual landmark updates (call processLandmarkData() when you have data)
+ *
+ * @example Built-in MediaPipe detection
+ * ```typescript
+ * const avatar = new Aniface({
+ *   videoElement: document.getElementById('webcam') as HTMLVideoElement,
+ *   canvasElement: document.getElementById('avatar') as HTMLCanvasElement,
+ *   modelPath: '/models/avatar.glb'
+ * })
+ * await avatar.initialize()
+ * avatar.start() // Automatic processing loop
+ * ```
+ *
+ * @example Manual updates (event-driven)
+ * ```typescript
+ * const avatar = new Aniface({
+ *   canvasElement: document.getElementById('avatar') as HTMLCanvasElement,
+ *   modelPath: '/models/avatar.glb'
+ * })
+ * await avatar.initialize()
+ *
+ * // Push data when events occur
+ * socket.on('landmarks', (data) => {
+ *   avatar.processLandmarkData(data)
+ * })
+ * ```
+ */
+export class Aniface {
+    constructor(config) {
+        this.landmarkManager = null;
+        this.avatarRenderer = null;
+        this.isRunning = false;
+        this.isInitialized = false;
+        this.animationFrameId = null;
+        this.noFaceDetectedCount = 0;
+        this.NO_FACE_THRESHOLD = 5; // Frames before triggering callback
+        this.config = config;
+        this.validateConfig();
+    }
+    /**
+     * Validate the configuration
+     */
+    validateConfig() {
+        // Canvas element is always required
+        if (!this.config.canvasElement) {
+            throw new Error('canvasElement is required');
+        }
+        if (!(this.config.canvasElement instanceof HTMLCanvasElement)) {
+            throw new Error('canvasElement must be an HTMLCanvasElement');
+        }
+        // Model path is always required
+        if (!this.config.modelPath) {
+            throw new Error('modelPath is required');
+        }
+        // Validate video element if provided
+        if (this.config.videoElement && !(this.config.videoElement instanceof HTMLVideoElement)) {
+            throw new Error('videoElement must be an HTMLVideoElement');
+        }
+    }
+    /**
+     * Initialize the avatar system
+     * Must be called before start()
+     */
+    async initialize() {
+        if (this.isInitialized) {
+            console.warn('Aniface already initialized');
+            return;
+        }
+        try {
+            console.log('🎭 Initializing Aniface...');
+            // Initialize landmark manager only if video element is provided
+            // Skip if user will provide landmark data manually via processLandmarkData()
+            if (this.config.videoElement) {
+                this.landmarkManager = new FacialLandmarkManager(this.config.landmarkConfig);
+                await this.landmarkManager.initialize();
+                console.log('✅ Landmark manager initialized');
+            }
+            else {
+                console.log('ℹ️  No video element provided - use processLandmarkData() for manual updates');
+            }
+            // Initialize avatar renderer (always needed)
+            this.avatarRenderer = new AvatarRenderer({
+                canvas: this.config.canvasElement,
+                modelPath: this.config.modelPath,
+                cameraConfig: this.config.cameraConfig,
+                lightingConfig: this.config.lightingConfig,
+                blendshapeMultipliers: this.config.blendshapeMultipliers,
+                modelOptions: this.config.modelOptions
+            });
+            // Sets up Three.js scene and loads avatar
+            await this.avatarRenderer.initialize();
+            console.log('✅ Avatar renderer initialized');
+            this.isInitialized = true;
+            console.log('✅ Aniface initialized successfully');
+            // Call ready callback
+            if (this.config.onReady) {
+                this.config.onReady();
+            }
+        }
+        catch (error) {
+            const err = error instanceof Error ? error : new Error(String(error));
+            console.error('❌ Failed to initialize Aniface:', err);
+            // Cleanup any partially initialized resources to prevent memory leaks
+            this.cleanupResources();
+            if (this.config.onError) {
+                this.config.onError(err);
+            }
+            throw err;
+        }
+    }
+    /**
+     * Cleanup all resources and reset state
+     * Used during initialization failure and destruction
+     */
+    cleanupResources() {
+        if (this.landmarkManager) {
+            this.landmarkManager.destroy();
+            this.landmarkManager = null;
+        }
+        if (this.avatarRenderer) {
+            this.avatarRenderer.destroy();
+            this.avatarRenderer = null;
+        }
+        this.isInitialized = false;
+    }
+    /**
+     * Start avatar processing
+     * Begins the facial tracking and animation loop
+     */
+    start() {
+        if (!this.isInitialized) {
+            throw new Error('Aniface not initialized. Call initialize() first.');
+        }
+        if (this.isRunning) {
+            console.warn('Avatar is already running');
+            return;
+        }
+        this.isRunning = true;
+        this.processFrame();
+        console.log('▶️  Avatar started');
+    }
+    /**
+     * Stop avatar processing
+     * Pauses the facial tracking loop
+     */
+    stop() {
+        if (!this.isRunning) {
+            console.warn('Avatar is not running');
+            return;
+        }
+        this.isRunning = false;
+        if (this.animationFrameId !== null) {
+            cancelAnimationFrame(this.animationFrameId);
+            this.animationFrameId = null;
+        }
+        console.log('⏸️  Avatar stopped');
+    }
+    /**
+     * Main processing loop - detects landmarks and updates avatar
+     */
+    processFrame() {
+        if (!this.isRunning)
+            return;
+        this.animationFrameId = requestAnimationFrame(() => this.processFrame());
+        if (!this.avatarRenderer) {
+            return;
+        }
+        try {
+            // Use built-in MediaPipe detection
+            if (this.landmarkManager && this.config.videoElement) {
+                const results = this.landmarkManager.detectLandmarks(this.config.videoElement);
+                if (results && results.faceLandmarks && results.faceLandmarks.length > 0) {
+                    // Face detected - reset counter
+                    this.noFaceDetectedCount = 0;
+                    // Update avatar with landmarks
+                    this.avatarRenderer.processLandmarks(results);
+                    // Trigger callback
+                    if (this.config.onLandmarksDetected) {
+                        this.config.onLandmarksDetected(results);
+                    }
+                }
+                else {
+                    // No face detected
+                    this.noFaceDetectedCount++;
+                    // Only trigger callback after threshold to avoid flicker
+                    if (this.noFaceDetectedCount === this.NO_FACE_THRESHOLD) {
+                        if (this.config.onNoFaceDetected) {
+                            this.config.onNoFaceDetected();
+                        }
+                    }
+                }
+            }
+            // Render the scene
+            this.avatarRenderer.render();
+        }
+        catch (error) {
+            console.error('Error processing frame:', error);
+            if (this.config.onError && error instanceof Error) {
+                this.config.onError(error);
+            }
+        }
+    }
+    /**
+     * Process facial landmark data directly without using the animation loop
+     * Use this for push-based updates (e.g., WebSocket events, button clicks)
+     *
+     * @param landmarkData - FaceLandmarkerResult from MediaPipe or compatible format
+     *
+     * @example
+     * ```typescript
+     * // Push-based: Receive landmark data from WebSocket
+     * socket.on('landmarks', (data) => {
+     *   avatar.processLandmarkData(data)
+     * })
+     *
+     * // Push-based: Update on button click
+     * button.onclick = () => {
+     *   const data = getPrerecordedLandmark()
+     *   avatar.processLandmarkData(data)
+     * }
+     * ```
+     */
+    processLandmarkData(landmarkData) {
+        if (!this.isInitialized) {
+            throw new Error('Aniface not initialized. Call initialize() first.');
+        }
+        if (!this.avatarRenderer) {
+            console.warn('Avatar renderer not ready');
+            return;
+        }
+        try {
+            // Validate landmark data
+            if (!landmarkData || !landmarkData.faceLandmarks || landmarkData.faceLandmarks.length === 0) {
+                console.warn('No face landmarks in provided data');
+                this.noFaceDetectedCount++;
+                if (this.noFaceDetectedCount === this.NO_FACE_THRESHOLD && this.config.onNoFaceDetected) {
+                    this.config.onNoFaceDetected();
+                }
+                return;
+            }
+            // Reset no-face counter since we have valid data
+            this.noFaceDetectedCount = 0;
+            // Update avatar with landmarks
+            this.avatarRenderer.processLandmarks(landmarkData);
+            // Trigger callback
+            if (this.config.onLandmarksDetected) {
+                this.config.onLandmarksDetected(landmarkData);
+            }
+            // Render the scene
+            this.avatarRenderer.render();
+        }
+        catch (error) {
+            console.error('Error processing landmark data:', error);
+            if (this.config.onError && error instanceof Error) {
+                this.config.onError(error);
+            }
+        }
+    }
+    /**
+     * Update canvas size (call when window is resized)
+     */
+    updateSize(width, height) {
+        if (this.avatarRenderer) {
+            this.avatarRenderer.updateSize(width, height);
+        }
+    }
+    /**
+     * Get the current video element (if provided)
+     */
+    getVideoElement() {
+        return this.config.videoElement;
+    }
+    /**
+     * Get the current canvas element
+     */
+    getCanvasElement() {
+        return this.config.canvasElement;
+    }
+    /**
+     * Get the avatar renderer instance (for advanced usage)
+     */
+    getRenderer() {
+        return this.avatarRenderer;
+    }
+    /**
+     * Get the landmark manager instance (for advanced usage)
+     */
+    getLandmarkManager() {
+        return this.landmarkManager;
+    }
+    /**
+     * Check if avatar is currently running
+     */
+    get running() {
+        return this.isRunning;
+    }
+    /**
+     * Check if avatar system is initialized
+     */
+    get ready() {
+        return this.isInitialized;
+    }
+    /**
+     * Destroy avatar and cleanup resources
+     * Call this when you're done with the avatar
+     */
+    destroy() {
+        console.log('🧹 Destroying Aniface...');
+        this.stop();
+        this.cleanupResources();
+        console.log('✅ Aniface destroyed');
+    }
+}
+//# sourceMappingURL=Aniface.js.map
