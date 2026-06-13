@@ -1,26 +1,31 @@
+{
+	# 비루트(sudo 없이) 실행 시 :80 같은 특권 포트를 건드리지 않도록.
+	# 자동 HTTP→HTTPS 리다이렉트 리스너를 끄고, HTTP 용도는 고포트로 옮김.
+	auto_https disable_redirects
+	http_port 8080
+}
+
 # ───────────────────────────────────────────────────────────────────────────
-# Caddy 정적 HTTPS 서버 설정 (웹캠은 HTTPS에서만 동작하므로 권장)
-#   설치:  https://caddyserver.com/docs/install   (단일 실행파일)
-#   실행:  이 파일이 있는 프로젝트 폴더에서  →  caddy run
-#   .wasm MIME(application/wasm)도 Caddy가 알아서 올바르게 서빙합니다.
+# Caddy 정적 HTTPS 서버 (웹캠은 HTTPS에서만 동작하므로 권장)
+#   설치:  https://caddyserver.com/docs/install
+#   실행:  이 파일이 있는 프로젝트 폴더에서  →  caddy run   (sudo 불필요)
 # ───────────────────────────────────────────────────────────────────────────
 
-# [A] 공개 도메인이 있을 때 — Let's Encrypt 인증서 자동 발급/갱신.
-#     example.com 을 실제 도메인으로 바꾸고 이 블록의 주석을 해제하세요.
+# [A] 공개 도메인이 있을 때 — Let's Encrypt 인증서 자동.
+#     이 경우엔 위 전역 블록의 disable_redirects/http_port 줄을 지우고
+#     sudo 로 80·443을 쓰거나 systemd 서비스로 실행하세요.
 #
 # avatar.example.com {
-#     root * .
-#     file_server
-#     encode zstd gzip
+# 	root * .
+# 	file_server
+# 	encode zstd gzip
 # }
 
-# [B] 내부망 IP/호스트로 접속할 때 — Caddy 내부 CA로 자체서명(self-signed).
-#     접속하는 기기에서 인증서 경고를 1회 수락하면 됩니다.
-#     (경고를 없애려면 클라이언트에 Caddy 루트 CA를 신뢰 등록)
-#     접속:  https://<서버-IP>:8443
+# [B] 내부망 IP/호스트로 접속 — 자체서명(self-signed) HTTPS.
+#     접속:  https://<서버IP>:8443   (접속 기기에서 인증서 경고 1회 수락)
 https://:8443 {
-    root * .
-    file_server
-    encode zstd gzip
-    tls internal
+	root * .
+	file_server
+	encode zstd gzip
+	tls internal
 }
