@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>상담사 아바타 — 한국어 텍스트 → 표정·립싱크 (aniface + Three.js)</title>
+
+<!--
+  ┌─ 이 파일은 index.html(웹캠→아바타)과 "완전히 분리된" 상담사 전용 페이지입니다.
+  │  • 같은 ./vendor, ./models 를 공유하지만 전역 변수 충돌이 없도록 캡슐화되어 있습니다.
+  │  • 웹캠/MediaPipe 를 쓰지 않습니다. 대신 텍스트(추후 TTS 텍스트)를 받아
+  │    한글→입모양(viseme) 타임라인으로 변환해 아바타를 말하게 합니다.
+  │  • 추후 STT→LLM→TTS 파이프라인과 병합하기 쉽도록 window.CounselorAvatar API를 노출합니다.
+  └─ 외부 TTS '오디오'가 준비되면 attachAudio()로 진폭 기반 모듈레이션을 켤 수 있습니다(현재는 텍스트 타이밍).
+-->
+
+<!-- three / aniface 만 사용 (mediapipe 불필요). index.html과 동일한 vendor를 가리켜 버전 일치 보장 -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three/build/three.module.js",
+    "three/": "./vendor/three/",
+    "aniface": "./vendor/aniface/index.js"
+  }
+}
+</script>
+
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --panel2: #1c2330; --line: #2b3340;
+    --text: #e6edf3; --muted: #8b97a7; --accent: #4f8cff; --accent2: #2dd4bf;
+    --danger: #ff6b6b; --warm: #ffb86b;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Pretendard, "Apple SD Gothic Neo", sans-serif; }
+  #app { display: flex; flex-direction: column; height: 100vh; }
+  header { padding: 10px 16px; border-bottom: 1px solid var(--line); display: flex;
+    align-items: center; gap: 12px; flex: 0 0 auto; }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0; }
+  header .tag { font-size: 11px; color: var(--muted); border: 1px solid var(--line);
+    padding: 2px 8px; border-radius: 999px; }
+  main { flex: 1 1 auto; display: flex; min-height: 0; }
+  #stage { flex: 1 1 auto; position: relative; min-width: 0; background:
+    radial-gradient(120% 120% at 50% 28%, #1b2433 0%, #0e1116 72%); }
+  #avatarCanvas { display: block; width: 100%; height: 100%; }
+
+  /* 말풍선/자막 (현재 음절 하이라이트) */
+  #caption { position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%);
+    max-width: min(80%, 760px); padding: 10px 16px; border-radius: 12px;
+    background: rgba(12,16,22,.72); border: 1px solid var(--line); backdrop-filter: blur(4px);
+    font-size: 18px; line-height: 1.6; text-align: center; color: #d7e0ea; min-height: 0;
+    opacity: 0; transition: opacity .25s; pointer-events: none; word-break: keep-all; }
+  #caption.show { opacity: 1; }
+  #caption .cur { color: #fff; background: var(--accent); border-radius: 5px;
+    padding: 0 2px; box-shadow: 0 0 0 1px var(--accent); }
+  #caption .done { color: var(--accent2); }
+
+  /* 상단 좌측 상태 배지 */
+  #speakDot { position: absolute; top: 12px; left: 14px; display: flex; align-items: center;
+    gap: 7px; font-size: 11px; color: var(--muted); }
+  #speakDot i { width: 9px; height: 9px; border-radius: 50%; background: #555;
+    box-shadow: 0 0 0 2px rgba(0,0,0,.4); transition: .2s; }
+  #speakDot.on i { background: var(--accent2); box-shadow: 0 0 10px var(--accent2); }
+
+  /* 컨트롤 패널 */
+  aside { flex: 0 0 320px; background: var(--panel); border-left: 1px solid var(--line);
+    overflow-y: auto; padding: 14px 14px 28px; }
+  aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em;
+    color: var(--muted); margin: 18px 0 8px; }
+  aside h2:first-child { margin-top: 4px; }
+  textarea#say { width: 100%; min-height: 90px; resize: vertical; background: var(--panel2);
+    color: var(--text); border: 1px solid var(--line); border-radius: 9px; padding: 10px;
+    font-size: 14px; line-height: 1.5; font-family: inherit; }
+  textarea#say:focus { outline: none; border-color: var(--accent); }
+  .btnrow { display: flex; gap: 8px; margin: 8px 0; }
+  .btn { appearance: none; border: 1px solid var(--line); background: var(--panel2);
+    color: var(--text); padding: 10px 14px; border-radius: 9px; font-size: 13px;
+    cursor: pointer; flex: 1; transition: .15s; }
+  .btn:hover { border-color: var(--accent); }
+  .btn:disabled { opacity: .45; cursor: default; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .btn.ghost { background: transparent; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 2px; }
+  .chip { font-size: 12px; color: var(--muted); border: 1px solid var(--line);
+    background: var(--panel2); border-radius: 999px; padding: 5px 10px; cursor: pointer; }
+  .chip:hover { border-color: var(--accent2); color: var(--text); }
+  select { width: 100%; background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px; font-size: 13px; }
+  input[type=range] { width: 100%; }
+  .slider { margin: 10px 0; }
+  .slider label { display: flex; justify-content: space-between; font-size: 12px;
+    color: var(--muted); margin-bottom: 4px; }
+  .slider label b { color: var(--text); font-weight: 600; }
+  .toggle { display: flex; align-items: center; justify-content: space-between;
+    font-size: 13px; padding: 8px 0; }
+  .switch { position: relative; width: 40px; height: 22px; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .track { position: absolute; inset: 0; background: var(--line); border-radius: 999px;
+    transition: .2s; cursor: pointer; }
+  .track::before { content: ""; position: absolute; width: 16px; height: 16px; left: 3px;
+    top: 3px; background: #fff; border-radius: 50%; transition: .2s; }
+  .switch input:checked + .track { background: var(--accent); }
+  .switch input:checked + .track::before { transform: translateX(18px); }
+  .status { font-size: 12px; color: var(--muted); line-height: 1.7; margin-top: 10px;
+    border-top: 1px solid var(--line); padding-top: 10px; }
+  .status b { color: var(--text); }
+  .hint { font-size: 11px; color: var(--muted); line-height: 1.5; margin-top: 4px; }
+
+  /* 오버레이 */
+  .overlay { position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px; text-align: center;
+    padding: 24px; background: rgba(14,17,22,.82); backdrop-filter: blur(3px); z-index: 5; }
+  .overlay.hidden { display: none; }
+  .overlay h3 { margin: 0; font-size: 18px; }
+  .overlay p { margin: 0; color: var(--muted); max-width: 440px; font-size: 13px; line-height: 1.6; }
+  .spinner { width: 30px; height: 30px; border: 3px solid var(--line);
+    border-top-color: var(--accent); border-radius: 50%; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #errOverlay { color: var(--danger); }
+  #errOverlay p { color: #ffd0d0; white-space: pre-wrap; word-break: break-word; }
+
+  /* 임베드 모드(?embed): 헤더·패널 숨기고 아바타만 */
+  body.embed header, body.embed aside { display: none; }
+
+  @media (max-width: 820px) {
+    main { flex-direction: column; }
+    aside { flex: 0 0 auto; border-left: none; border-top: 1px solid var(--line); }
+    #stage { min-height: 48vh; }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>🧑‍⚕️ 상담사 아바타</h1>
+    <span class="tag">한국어 텍스트 → 표정·입모양 · aniface · Three.js</span>
+  </header>
+
+  <main>
+    <div id="stage">
+      <canvas id="avatarCanvas"></canvas>
+
+      <div id="speakDot"><i></i><span id="speakLbl">대기</span></div>
+      <div id="caption"></div>
+
+      <!-- 로딩 -->
+      <div id="loading" class="overlay">
+        <div class="spinner"></div>
+        <p id="loadingMsg">상담사 아바타 로딩 중…</p>
+      </div>
+
+      <!-- 오류 -->
+      <div id="errOverlay" class="overlay hidden">
+        <h3>⚠️ 오류</h3>
+        <p id="errMsg"></p>
+        <button id="errClose" class="btn" style="flex:none;padding:8px 18px;">닫기</button>
+      </div>
+    </div>
+
+    <aside>
+      <h2>상담사가 말할 내용</h2>
+      <textarea id="say" placeholder="여기에 한국어 문장을 입력하세요.&#10;예) 안녕하세요. 오늘 기분은 어떠세요?"></textarea>
+      <div class="chips" id="examples">
+        <span class="chip">안녕하세요. 오늘 기분은 어떠세요?</span>
+        <span class="chip">천천히 말씀해 주셔도 괜찮아요.</span>
+        <span class="chip">그렇게 느끼셨군요. 많이 힘드셨겠어요.</span>
+        <span class="chip">우리 함께 방법을 찾아봐요!</span>
+      </div>
+      <div class="btnrow">
+        <button id="speakBtn" class="btn primary">▶ 말하기</button>
+        <button id="stopBtn" class="btn ghost" disabled>■ 정지</button>
+      </div>
+      <div class="hint">입력한 문장을 음절 단위로 분석해 입모양·표정·고개 움직임으로 따라 합니다. (지금은 무음 — 추후 TTS 오디오 연동 가능)</div>
+
+      <h2>감정 / 톤</h2>
+      <select id="emoSel">
+        <option value="warm" selected>따뜻함 (기본 상담사 톤)</option>
+        <option value="neutral">중립</option>
+        <option value="empathy">공감 (눈썹·고개 기울임)</option>
+        <option value="happy">기쁨 (밝은 미소)</option>
+        <option value="calm">차분</option>
+      </select>
+      <div class="hint">추후 LLM/TTS가 감정 라벨을 함께 주면 <code>setEmotion()</code>으로 자동 적용할 수 있습니다.</div>
+
+      <h2>말하기 / 표정 튜닝</h2>
+      <div class="slider">
+        <label>말 속도 <b id="vRate">5.0 음절/초</b></label>
+        <input type="range" id="sRate" min="2.5" max="8" step="0.1" value="5" />
+      </div>
+      <div class="slider">
+        <label>입 벌림 강도 <b id="vJaw">1.00×</b></label>
+        <input type="range" id="sJaw" min="0" max="2" step="0.05" value="1" />
+      </div>
+      <div class="slider">
+        <label>전체 표정 강도 <b id="vMaster">1.00×</b></label>
+        <input type="range" id="sMaster" min="0" max="2" step="0.05" value="1" />
+      </div>
+      <div class="slider">
+        <label>따뜻함(미소) <b id="vWarm">1.00×</b></label>
+        <input type="range" id="sWarm" min="0" max="2" step="0.05" value="1" />
+      </div>
+      <div class="slider">
+        <label>깜빡임 빈도 <b id="vBlink">1.00×</b></label>
+        <input type="range" id="sBlink" min="0" max="2" step="0.05" value="1" />
+      </div>
+      <div class="slider">
+        <label>고개 움직임 <b id="vHead">1.00×</b></label>
+        <input type="range" id="sHead" min="0" max="2" step="0.05" value="1" />
+      </div>
+
+      <h2>구도 (화면)</h2>
+      <div class="slider">
+        <label>확대 <b id="vZoom">1.25×</b></label>
+        <input type="range" id="sZoom" min="0.6" max="2.4" step="0.05" value="1.25" />
+      </div>
+      <div class="slider">
+        <label>상하 위치 <b id="vVy">+0.06</b></label>
+        <input type="range" id="sVy" min="-0.15" max="0.30" step="0.01" value="0.06" />
+      </div>
+      <div class="toggle">
+        <span>구도 고정 (드래그·줌 잠금)</span>
+        <label class="switch"><input type="checkbox" id="lockChk" checked /><span class="track"></span></label>
+      </div>
+
+      <div class="status" id="status">
+        상태: <b id="stState">로딩 중</b><br />
+        진행: <b id="stProg">—</b>
+      </div>
+    </aside>
+  </main>
+</div>
+
+<script type="module">
+  // ── 라이브러리 로드 ───────────────────────────────────────────────────
+  let Aniface, MEDIAPIPE_BLENDSHAPE_NAMES, THREE, LS;
+  try {
+    const [aniface, three, lipsync] = await Promise.all([
+      import('aniface'),
+      import('three'),
+      import('./vendor/counselor/lipsync.js'),
+    ]);
+    Aniface = aniface.Aniface;
+    MEDIAPIPE_BLENDSHAPE_NAMES = aniface.MEDIAPIPE_BLENDSHAPE_NAMES;
+    THREE = three;
+    LS = lipsync; // { buildTimeline, samplePose, currentSyllable, MOUTH_KEYS, ... }
+  } catch (e) {
+    showError('라이브러리 로드 실패: ' + (e?.message || e) +
+      '\n\n로컬 서버로 실행했는지 확인하세요 (file:// 직접 열기 불가).');
+    throw e;
+  }
+
+  // ── 상수 ─────────────────────────────────────────────────────────────
+  const MODEL_PATH = './models/counselor.glb';
+
+  // 이 페이지가 매 프레임 "직접 0~1로 써 주는" 블렌드셰이프 집합.
+  // (aniface는 넘긴 키만 갱신하므로, 매 프레임 같은 집합을 보내 '값이 멈추는' 현상을 방지)
+  const EXPR_KEYS = [
+    'eyeBlinkLeft', 'eyeBlinkRight', 'eyeSquintLeft', 'eyeSquintRight',
+    'eyeWideLeft', 'eyeWideRight', 'cheekSquintLeft', 'cheekSquintRight',
+    'browInnerUp', 'browOuterUpLeft', 'browOuterUpRight', 'browDownLeft', 'browDownRight',
+  ];
+  const CONTROLLED = [...LS.MOUTH_KEYS, ...EXPR_KEYS];
+
+  // 감정 프리셋(표정 베이스라인). headTilt는 고개 roll로 별도 사용.
+  const EMOTIONS = {
+    neutral: {},
+    warm:    { mouthSmileLeft: 0.12, mouthSmileRight: 0.12, cheekSquintLeft: 0.06, cheekSquintRight: 0.06, browInnerUp: 0.05 },
+    empathy: { browInnerUp: 0.24, mouthSmileLeft: 0.05, mouthSmileRight: 0.05, headTilt: 0.06 },
+    happy:   { mouthSmileLeft: 0.34, mouthSmileRight: 0.34, cheekSquintLeft: 0.20, cheekSquintRight: 0.20, eyeSquintLeft: 0.10, eyeSquintRight: 0.10, browInnerUp: 0.05 },
+    calm:    { browInnerUp: 0.08, mouthSmileLeft: 0.06, mouthSmileRight: 0.06 },
+  };
+
+  // ── 표정 강도(aniface multipliers, index.html과 동일한 패턴) ───────────
+  const multipliers = {};
+  const GROUPS = {
+    jawOpen:    ['jawOpen'],
+    mouthSmile: ['mouthSmileLeft', 'mouthSmileRight'],
+    eyeBlink:   ['eyeBlinkLeft', 'eyeBlinkRight'],
+    brow:       ['browInnerUp', 'browOuterUpLeft', 'browOuterUpRight'],
+  };
+  let master = 1;
+  const gain = { jawOpen: 1, mouthSmile: 1, eyeBlink: 1.1, brow: 1.1 };
+  function recompute() {
+    for (const n of MEDIAPIPE_BLENDSHAPE_NAMES) multipliers[n] = master;
+    for (const [g, names] of Object.entries(GROUPS))
+      for (const n of names) multipliers[n] = master * gain[g];
+  }
+  recompute();
+
+  // ── DOM ──────────────────────────────────────────────────────────────
+  const $ = (id) => document.getElementById(id);
+  const stage = $('stage'), canvas = $('avatarCanvas');
+  const loading = $('loading'), loadingMsg = $('loadingMsg');
+  const errOverlay = $('errOverlay'), errMsg = $('errMsg');
+  const sayEl = $('say'), speakBtn = $('speakBtn'), stopBtn = $('stopBtn');
+  const captionEl = $('caption'), speakDot = $('speakDot'), speakLbl = $('speakLbl');
+
+  // ── 애니메이션 상태 ───────────────────────────────────────────────────
+  let avatar = null, rafId = null, lastT = performance.now();
+
+  // 립싱크
+  let timeline = null;        // { keys, sylls, marks, duration }
+  let speaking = false;
+  let speakStart = 0;         // performance.now() 기준
+  let rate = 5.0;
+  let lastSyll = -1;
+  let captionChars = [];
+
+  // 현재(부드럽게 수렴 중) 입 포즈
+  const curMouth = {};
+  for (const k of LS.MOUTH_KEYS) curMouth[k] = 0;
+
+  // 표정/감정
+  let emotionName = 'warm';
+  let emoWeight = 1.0;        // '따뜻함(미소)' 슬라이더
+
+  // 깜빡임
+  let blinkAmp = 1.0, blinkFreq = 1.0;
+  let nextBlink = performance.now() + 1500;
+  let blinkStart = -1, blinkDur = 130, blinkDouble = false;
+
+  // 고개 움직임
+  let headAmp = 1.0;
+  let nodActive = false, nodStart = 0;
+  const processedMarks = new Set();
+
+  // 오디오 훅(추후 외부 TTS 연동용 — 지금은 비활성)
+  let audioAnalyser = null, audioData = null, audioActive = false, audioGain = 1.0;
+
+  // 재사용 객체
+  const _e = new THREE.Euler(), _m = new THREE.Matrix4();
+  const DUMMY_LANDMARKS = [[{ x: 0, y: 0, z: 0 }]]; // processLandmarkData 게이트 통과용(내용은 미사용)
+
+  const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+
+  // ── 오버레이/오류 ─────────────────────────────────────────────────────
+  function showError(msg) {
+    if (!errMsg) { alert(msg); return; }
+    errMsg.textContent = msg;
+    errOverlay.classList.remove('hidden');
+    loading.classList.add('hidden');
+  }
+  $('errClose')?.addEventListener('click', () => errOverlay.classList.add('hidden'));
+  function setLoading(on, msg) { loading.classList.toggle('hidden', !on); if (msg) loadingMsg.textContent = msg; }
+  function setState(s) { $('stState').textContent = s; }
+
+  // ── 캔버스 크기 ───────────────────────────────────────────────────────
+  function fit() {
+    const w = stage.clientWidth, h = stage.clientHeight;
+    canvas.width = w; canvas.height = h;
+    if (avatar?.updateSize) avatar.updateSize(w, h);
+  }
+  window.addEventListener('resize', fit);
+
+  // ── 아바타 생성 (index.html과 동일한 구도/조명/모델옵션 → '동일 해상도·크기') ──
+  async function buildAvatar() {
+    fit();
+    const a = new Aniface({
+      canvasElement: canvas,           // videoElement 없음 = manual 입력 모드(웹캠 미사용)
+      modelPath: MODEL_PATH,
+      blendshapeMultipliers: multipliers,
+      modelOptions: {
+        scale: 1.0, center: true, autoRotate: true, rotation: 0, // Streamoji 계열은 정면이 기본
+        fullBodyAvatar: true, axisMapping: 'standard',
+      },
+      cameraConfig: { fov: 45, enableControls: true, enableZoom: true, position: [0, 0, 1.2], target: [0, 0, 0] },
+      lightingConfig: { ambientIntensity: 1.1, directionalIntensity: 1.4, directionalPosition: [2, 3, 3] },
+      onError: (err) => showError('아바타 처리 오류: ' + (err?.message || err)),
+    });
+    await a.initialize();
+    avatar = a;
+    frameHead(avatar);
+    fit();
+  }
+
+  // 머리 본 위치/크기를 찾아 카메라 구도 배치 (index.html 로직 재사용)
+  let frameCache = null;
+  const framing = { zoom: 1.25, vy: 0.06, lock: true };
+  function frameHead(av) {
+    const r = av.getRenderer?.(); if (!r) return;
+    const scene = r.getScene?.(), cam = r.getCamera?.(); if (!scene || !cam) return;
+    scene.updateMatrixWorld(true);
+    let head = null;
+    scene.traverse((o) => { if (!head && o.isBone && o.name && o.name.toLowerCase() === 'head') head = o; });
+    const box = new THREE.Box3().setFromObject(scene);
+    const size = new THREE.Vector3(); box.getSize(size);
+    const baseTarget = new THREE.Vector3();
+    if (head) head.getWorldPosition(baseTarget);
+    else { box.getCenter(baseTarget); baseTarget.y = box.max.y - size.y * 0.12; }
+    frameCache = { baseTarget, size };
+    applyFraming(av);
+  }
+  function applyFraming(av) {
+    if (!frameCache) return;
+    const r = av?.getRenderer?.(); const cam = r?.getCamera?.(); if (!cam) return;
+    const { baseTarget, size } = frameCache;
+    const target = baseTarget.clone(); target.y += size.y * framing.vy;
+    const dist = Math.max(size.y * 0.55 / framing.zoom, 0.2);
+    cam.position.set(target.x, target.y, target.z + dist);
+    cam.near = Math.max(dist / 100, 0.01); cam.far = dist * 100; cam.updateProjectionMatrix();
+    const controls = r.controls;
+    if (controls) {
+      controls.target.copy(target);
+      controls.minDistance = dist * 0.25; controls.maxDistance = dist * 5;
+      controls.enabled = !framing.lock;
+      controls.update();
+    } else { cam.lookAt(target); }
+  }
+
+  // ── 말하기 / 정지 ─────────────────────────────────────────────────────
+  function speak(text) {
+    text = (text ?? '').toString();
+    if (!text.trim()) return;
+    timeline = LS.buildTimeline(text, { rate });
+    speakStart = performance.now();
+    speaking = true;
+    lastSyll = -1;
+    processedMarks.clear();
+    // 자막 준비
+    captionChars = Array.from(text);
+    renderCaption(-1);
+    captionEl.classList.add('show');
+    speakDot.classList.add('on'); speakLbl.textContent = '말하는 중';
+    setState('말하는 중');
+    speakBtn.disabled = true; stopBtn.disabled = false;
+  }
+  function stopSpeaking() {
+    speaking = false; timeline = null;
+    captionEl.classList.remove('show');
+    speakDot.classList.remove('on'); speakLbl.textContent = '대기';
+    setState('대기'); $('stProg').textContent = '—';
+    speakBtn.disabled = false; stopBtn.disabled = true;
+  }
+
+  function renderCaption(curIdx) {
+    if (!captionChars.length) { captionEl.textContent = ''; return; }
+    let html = '';
+    for (let i = 0; i < captionChars.length; i++) {
+      const c = captionChars[i].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;');
+      const cls = i === curIdx ? 'cur' : (curIdx >= 0 && i < curIdx ? 'done' : '');
+      html += cls ? `<span class="${cls}">${c}</span>` : c;
+    }
+    captionEl.innerHTML = html;
+  }
+
+  // ── 매 프레임 업데이트 ────────────────────────────────────────────────
+  function update(now) {
+    const dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
+
+    // 1) 입모양 타깃 (말하는 중이면 타임라인에서 샘플, 아니면 닫힘)
+    let target = LS.REST_POSE;
+    let curJaw = 0;
+    if (speaking && timeline) {
+      const tt = (now - speakStart) / 1000;
+      if (tt >= timeline.duration) { stopSpeaking(); }
+      else {
+        target = LS.samplePose(timeline.keys, tt);
+        // 자막 하이라이트
+        const ci = LS.currentSyllable(timeline.sylls, tt);
+        if (ci !== lastSyll) {
+          lastSyll = ci;
+          const charIdx = ci >= 0 ? timeline.sylls[ci].ci : -1;
+          renderCaption(charIdx);
+        }
+        $('stProg').textContent = `${Math.min(100, Math.round(tt / timeline.duration * 100))}%`;
+      }
+    }
+    // 입 포즈 부드럽게 수렴(스냅 방지). 닫힘은 약간 더 빠르게.
+    const aMouth = 1 - Math.exp(-dt / 0.045);
+    for (const k of LS.MOUTH_KEYS) {
+      const tv = target[k] || 0;
+      curMouth[k] += (tv - curMouth[k]) * aMouth;
+    }
+    curJaw = curMouth.jawOpen;
+
+    // 1-b) (옵션) 외부 TTS 오디오가 붙어 있으면 진폭으로 입 벌림 보강
+    if (audioActive && audioAnalyser) {
+      audioAnalyser.getByteTimeDomainData(audioData);
+      let sum = 0;
+      for (let i = 0; i < audioData.length; i++) { const v = (audioData[i] - 128) / 128; sum += v * v; }
+      const rms = Math.sqrt(sum / audioData.length);
+      const audioJaw = clamp01(rms * 3.2 * audioGain);
+      // 텍스트 입모양은 '형태', 오디오는 '에너지' → 더 크게 벌어지는 쪽을 채택
+      curMouth.jawOpen = Math.max(curMouth.jawOpen, audioJaw);
+      curJaw = curMouth.jawOpen;
+    }
+
+    // 2) 표정 누적(acc)
+    const acc = {};
+    const add = (k, v) => { if (v) acc[k] = (acc[k] || 0) + v; };
+    for (const k of LS.MOUTH_KEYS) add(k, curMouth[k]);
+
+    // 감정 베이스라인
+    const emo = EMOTIONS[emotionName] || {};
+    for (const k in emo) { if (k === 'headTilt') continue; add(k, emo[k] * emoWeight); }
+
+    // 문장부호 기반 가벼운 감정(말하는 중, 마크 근처에서)
+    let markPitch = 0, markRoll = 0;
+    if (speaking && timeline) {
+      const tt = (now - speakStart) / 1000;
+      for (const mk of timeline.marks) {
+        const d = Math.abs(mk.t - tt);
+        if (d < 0.5) {
+          const f = (1 - d / 0.5);
+          if (mk.type === 'question') { add('browInnerUp', 0.35 * f); add('browOuterUpLeft', 0.22 * f); add('browOuterUpRight', 0.22 * f); markPitch += -0.05 * f; }
+          else if (mk.type === 'exclaim') { add('mouthSmileLeft', 0.22 * f); add('mouthSmileRight', 0.22 * f); add('browOuterUpLeft', 0.18 * f); add('browOuterUpRight', 0.18 * f); }
+          else if (mk.type === 'period') { add('browInnerUp', 0.05 * f); }
+        }
+        // 마침/느낌표 지날 때 한 번 끄덕임 트리거
+        if ((mk.type === 'period' || mk.type === 'exclaim') && tt >= mk.t && !processedMarks.has(mk)) {
+          processedMarks.add(mk); nodActive = true; nodStart = now;
+        }
+      }
+    }
+
+    // 3) 깜빡임
+    let blink = 0;
+    if (blinkStart < 0 && now >= nextBlink) { blinkStart = now; blinkDouble = Math.random() < 0.12; }
+    if (blinkStart >= 0) {
+      const e = now - blinkStart;
+      if (e <= blinkDur) blink = Math.sin((e / blinkDur) * Math.PI);
+      else { // 종료 → 다음 예약(빈도 슬라이더 반영). 가끔 더블 블링크.
+        if (blinkDouble) { blinkDouble = false; blinkStart = now + 60; }
+        else { blinkStart = -1; const base = 2400 + Math.random() * 3200; nextBlink = now + base / Math.max(0.2, blinkFreq); }
+      }
+    }
+    acc.eyeBlinkLeft = Math.max(acc.eyeBlinkLeft || 0, blink * blinkAmp);
+    acc.eyeBlinkRight = Math.max(acc.eyeBlinkRight || 0, blink * blinkAmp);
+
+    // 4) 합성 블렌드셰이프 카테고리(항상 같은 집합을 송신)
+    const categories = new Array(CONTROLLED.length);
+    for (let i = 0; i < CONTROLLED.length; i++) {
+      const k = CONTROLLED[i];
+      categories[i] = { categoryName: k, score: clamp01(acc[k] || 0) };
+    }
+
+    // 5) 고개 움직임(몸짓) → 회전 행렬. aniface가 Head/Neck/Spine2로 자연스럽게 캐스케이드.
+    const tSec = now / 1000;
+    let pitch = 0.025 * Math.sin(tSec * 0.6) + 0.015 * Math.sin(tSec * 0.23 + 1.3);
+    let yaw   = 0.035 * Math.sin(tSec * 0.5 + 0.7) + 0.02 * Math.sin(tSec * 0.17);
+    let roll  = 0.020 * Math.sin(tSec * 0.4 + 2.1);
+    pitch *= headAmp; yaw *= headAmp; roll *= headAmp;
+    pitch += -0.03 * curJaw * headAmp;     // 입 벌릴 때 살짝 끄덕
+    if (nodActive) {
+      const e = (now - nodStart) / 1000;
+      if (e < 0.6) pitch += 0.09 * Math.sin((e / 0.6) * Math.PI) * Math.exp(-e * 2) * headAmp;
+      else nodActive = false;
+    }
+    pitch += markPitch * headAmp;
+    roll += ((EMOTIONS[emotionName]?.headTilt) || 0) * emoWeight + markRoll;
+
+    _e.set(pitch, yaw, roll, 'XYZ');
+    _m.makeRotationFromEuler(_e);
+
+    // 6) aniface로 주입(= 렌더까지 수행). 웹캠 경로와 동일한 데이터 형식.
+    if (avatar?.ready) {
+      avatar.processLandmarkData({
+        faceLandmarks: DUMMY_LANDMARKS,
+        faceBlendshapes: [{ categories }],
+        facialTransformationMatrixes: [{ data: _m.elements }],
+      });
+    }
+  }
+
+  function loop() {
+    rafId = requestAnimationFrame(loop);
+    update(performance.now());
+  }
+
+  // ── 공개 API (추후 STT→LLM→TTS 파이프라인 / 외부 시스템 연동용) ─────────
+  const api = {
+    /** 상담사가 텍스트를 말하게 함 */
+    speak,
+    /** 즉시 멈추고 입을 닫음 */
+    stop: stopSpeaking,
+    /** 감정/톤 변경: setEmotion('empathy', 1.0) */
+    setEmotion(name, weight = 1.0) {
+      if (EMOTIONS[name]) { emotionName = name; emoWeight = weight; $('emoSel').value = name; }
+    },
+    /** 말 속도(초당 음절 수) */
+    setRate(v) { rate = Math.max(2.5, Math.min(8, +v)); $('sRate').value = rate; $('vRate').textContent = rate.toFixed(1) + ' 음절/초'; },
+    /**
+     * 외부 TTS 오디오 연동(선택): <audio> 요소나 MediaStream을 넘기면
+     * 재생 진폭으로 입 벌림을 보강합니다. 입모양 '형태'는 계속 텍스트가 만듭니다.
+     * 사용 예: CounselorAvatar.speak(text); CounselorAvatar.attachAudio(audioEl); audioEl.play();
+     */
+    attachAudio(elOrStream, opts = {}) {
+      try {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        const ctx = api._actx || (api._actx = new AC());
+        let src;
+        if (elOrStream instanceof HTMLMediaElement) src = ctx.createMediaElementSource(elOrStream);
+        else if (elOrStream instanceof MediaStream) src = ctx.createMediaStreamSource(elOrStream);
+        else throw new Error('attachAudio: <audio> 요소 또는 MediaStream 필요');
+        audioAnalyser = ctx.createAnalyser(); audioAnalyser.fftSize = 1024;
+        audioData = new Uint8Array(audioAnalyser.fftSize);
+        src.connect(audioAnalyser);
+        if (elOrStream instanceof HTMLMediaElement) audioAnalyser.connect(ctx.destination);
+        audioGain = opts.gain ?? 1.0; audioActive = true;
+        return true;
+      } catch (e) { console.warn('attachAudio 실패:', e); return false; }
+    },
+    detachAudio() { audioActive = false; audioAnalyser = null; audioData = null; },
+    get speaking() { return speaking; },
+    get ready() { return !!avatar?.ready; },
+  };
+  window.CounselorAvatar = api;
+  window.counselorSpeak = speak; // 간편 별칭
+
+  // ── UI 바인딩 ─────────────────────────────────────────────────────────
+  speakBtn.addEventListener('click', () => speak(sayEl.value));
+  stopBtn.addEventListener('click', stopSpeaking);
+  sayEl.addEventListener('keydown', (e) => { // Ctrl/Cmd+Enter = 말하기
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); speak(sayEl.value); }
+  });
+  $('examples').addEventListener('click', (e) => {
+    if (e.target.classList.contains('chip')) { sayEl.value = e.target.textContent; speak(sayEl.value); }
+  });
+  $('emoSel').addEventListener('change', (e) => { emotionName = e.target.value; });
+
+  const fmt = (v) => (+v).toFixed(2) + '×';
+  $('sRate').addEventListener('input', (e) => { rate = +e.target.value; $('vRate').textContent = rate.toFixed(1) + ' 음절/초'; });
+  $('sJaw').addEventListener('input', (e) => { gain.jawOpen = +e.target.value; $('vJaw').textContent = fmt(e.target.value); recompute(); });
+  $('sMaster').addEventListener('input', (e) => { master = +e.target.value; $('vMaster').textContent = fmt(e.target.value); recompute(); });
+  $('sWarm').addEventListener('input', (e) => { emoWeight = +e.target.value; gain.mouthSmile = +e.target.value; $('vWarm').textContent = fmt(e.target.value); recompute(); });
+  $('sBlink').addEventListener('input', (e) => { blinkFreq = +e.target.value; $('vBlink').textContent = fmt(e.target.value); });
+  $('sHead').addEventListener('input', (e) => { headAmp = +e.target.value; $('vHead').textContent = fmt(e.target.value); });
+
+  $('sZoom').addEventListener('input', (e) => { framing.zoom = +e.target.value; $('vZoom').textContent = (+e.target.value).toFixed(2) + '×'; if (avatar) applyFraming(avatar); });
+  $('sVy').addEventListener('input', (e) => { framing.vy = +e.target.value; $('vVy').textContent = (e.target.value >= 0 ? '+' : '') + (+e.target.value).toFixed(2); if (avatar) applyFraming(avatar); });
+  $('lockChk').addEventListener('change', (e) => { framing.lock = e.target.checked; if (avatar) applyFraming(avatar); });
+
+  // 임베드 모드(iframe): ?embed = 패널/헤더 숨김
+  if (new URLSearchParams(location.search).has('embed')) document.body.classList.add('embed');
+
+  // ── 초기화 (웹캠 권한 불필요 → 자동 로드) ──────────────────────────────
+  async function init() {
+    if (location.protocol === 'file:') {
+      showError('이 페이지가 file:// 로 열렸습니다.\n브라우저 정책상 모델(.glb) 로드가 차단됩니다.\n\n프로젝트 폴더에서 로컬 서버를 띄운 뒤 접속하세요:\n\npython3 -m http.server 8000');
+      return;
+    }
+    try {
+      setLoading(true, '상담사 아바타 로딩 중…');
+      await buildAvatar();
+      setLoading(false);
+      setState('대기');
+      loop();
+    } catch (e) {
+      let m = e?.message || String(e);
+      if (/fetch|load avatar/i.test(m)) m += '\n\n확인: 로컬 서버 실행 여부, models/counselor.glb 존재 여부, 콘솔(F12)의 실패 URL.';
+      showError(m);
+    }
+  }
+  init();
+</script>
+</body>
+</html>
